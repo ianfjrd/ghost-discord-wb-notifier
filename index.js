@@ -30,7 +30,13 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
   console.error("Missing env vars: DISCORD_TOKEN and CLIENT_ID are required.");
   process.exit(1);
 }
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
 
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
 // ===================== Render Web Server =====================
 const app = express();
 app.get("/", (_, res) => res.status(200).send("WB Spawn Now Bot is running."));
@@ -467,4 +473,6 @@ client.once("ready", async () => {
   notifyTick().catch(console.error);
 });
 
-client.login(DISCORD_TOKEN);
+client.login(DISCORD_TOKEN)
+  .then(() => console.log("Discord login() called successfully (waiting for READY)..."))
+  .catch((err) => console.error("Discord login failed:", err));
