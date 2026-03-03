@@ -252,5 +252,27 @@ if __name__ == "__main__":
     if not token:
         raise RuntimeError("Set DISCORD_TOKEN in Render Environment Variables.")
 
+    # Start the web server thread for Render Web Service
     threading.Thread(target=run_web_server, daemon=True).start()
-    bot.run(token)
+
+    # Run the bot with backoff so it doesn't spam Discord on failures (429, network, etc.)
+    import asyncio
+    from discord.errors import HTTPException
+
+    async def main():
+        delay = 5
+        while True:
+            try:
+                await bot.start(token)
+            except HTTPException as e:
+                # 429 or other HTTP issues during login/start
+                print(f"Discord HTTPException: {e}. Retrying...")
+            except Exception as e:
+                print(f"Bot crashed: {e}. Retrying...")
+
+            # backoff (caps at 5 minutes)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
+
+    asyncio.run(main())
+
