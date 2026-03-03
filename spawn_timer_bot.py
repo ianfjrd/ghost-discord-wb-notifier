@@ -3,188 +3,254 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import json
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, timezone
 
+# ---------------- CONFIG ----------------
 DATA_FILE = "spawns.json"
 SPAWN_INTERVAL_HOURS = 2
-
 UTC = timezone.utc
+MANILA = timezone(timedelta(hours=8))
 
+CHECK_INTERVAL_SECONDS = 5  # how often to check if spawn time is reached
+
+# ---------------- WEB SERVER (for Render Web Service) ----------------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK - Discord bot is running")
+
+    def log_message(self, format, *args):
+        return
+
+def run_web_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+# ---------------- TIME HELPERS ----------------
 def now_utc() -> datetime:
     return datetime.now(tz=UTC)
 
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-def guild_key(guild_id: int) -> str:
-    return str(guild_id)
-
-def boss_key(name: str) -> str:
-    return name.strip().lower() if name else "default"
-
-def dt_to_iso(dt: datetime) -> str:
-    return dt.astimezone(UTC).isoformat()
-
-def iso_to_dt(s: str) -> datetime:
-    return datetime.fromisoformat(s).astimezone(UTC)
-
-def format_discord_timestamp(dt: datetime) -> str:
-    # shows both absolute and relative time in Discord
+def format_time(dt: datetime) -> str:
     unix = int(dt.timestamp())
-    return f"<t:{unix}:F>  •  <t:{unix}:R>"
+    return f"<t:{unix}:F> • <t:{unix}:R>"
 
-class SpawnStore:
-    def __init__(self):
-        self.data = load_data()
+def parse_time(inp: str) -> datetime | None:
+    """
+    Accepts:
+      +120        (minutes)
+      +2h / +90m  (relative)
+      2026-03-03 18:30  (absolute, assumed Asia/Manila)
+    """
+    inp = (inp or "").strip()
+    if not inp:
+        return None
 
-    def get_next_spawn(self, guild_id: int, boss: str) -> datetime | None:
-        g = self.data.get(guild_key(guild_id), {})
-        b = g.get(boss_key(boss))
-        if not b:
-            return None
-        return iso_to_dt(b["next_spawn"])
-
-    def set_next_spawn(self, guild_id: int, boss: str, next_spawn: datetime):
-        gid = guild_key(guild_id)
-        bk = boss_key(boss)
-        if gid not in self.data:
-            self.data[gid] = {}
-        self.data[gid][bk] = {"next_spawn": dt_to_iso(next_spawn)}
-        save_data(self.data)
-
-store = SpawnStore()
-
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-class SpawnView(discord.ui.View):
-    def __init__(self, boss_name: str):
-        super().__init__(timeout=None)
-        self.boss_name = boss_name
-
-    @discord.ui.button(label="Boss Down (Start 2h)", style=discord.ButtonStyle.success, custom_id="spawn:bossdown")
-    async def boss_down(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ns = now_utc() + timedelta(hours=SPAWN_INTERVAL_HOURS)
-        store.set_next_spawn(interaction.guild_id, self.boss_name, ns)
-        await interaction.response.send_message(
-            f"✅ **{self.boss_name}** marked as down.\nNext spawn: {format_discord_timestamp(ns)}",
-            ephemeral=False
-        )
-
-    @discord.ui.button(label="Show Timer", style=discord.ButtonStyle.primary, custom_id="spawn:show")
-    async def show_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ns = store.get_next_spawn(interaction.guild_id, self.boss_name)
-        if not ns:
-            await interaction.response.send_message(
-                f"ℹ️ No timer set yet for **{self.boss_name}**. Click **Boss Down** when it dies.",
-                ephemeral=True
-            )
-            return
-        await interaction.response.send_message(
-            f"⏳ **{self.boss_name}** next spawn: {format_discord_timestamp(ns)}",
-            ephemeral=False
-        )
-
-    @discord.ui.button(label="Edit Time (Forgot to click)", style=discord.ButtonStyle.secondary, custom_id="spawn:edithelp")
-    async def edit_help(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            "To edit manually, use:\n"
-            f"**/setspawn boss:{self.boss_name} time:** `YYYY-MM-DD HH:MM` (24h) **OR** `+minutes` like `+15` **OR** `+hours` like `+2`\n"
-            "Examples:\n"
-            "`/setspawn boss:enigma time:+120`\n"
-            "`/setspawn boss:enigma time:2026-03-03 18:30`",
-            ephemeral=True
-        )
-
-@bot.event
-async def on_ready():
-    # Register persistent views so buttons keep working after restart
-    bot.add_view(SpawnView("default"))
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands.")
-    except Exception as e:
-        print("Slash sync error:", e)
-
-@bot.tree.command(name="spawnpanel", description="Post the boss spawn timer panel with buttons.")
-@app_commands.describe(boss="Boss name (optional). Example: enigma, sunstone boss, etc.")
-async def spawnpanel(interaction: discord.Interaction, boss: str = "default"):
-    view = SpawnView(boss)
-    bot.add_view(view)  # ensure it's persistent
-    await interaction.response.send_message(
-        f"📌 **Spawn Timer Panel — {boss}**\nUse the buttons below:",
-        view=view
-    )
-
-def parse_time_input(inp: str) -> datetime | None:
-    inp = inp.strip()
-    # Relative: +number (minutes by default)
     if inp.startswith("+"):
-        val = inp[1:].strip()
+        val = inp[1:].strip().lower()
         if val.isdigit():
-            mins = int(val)
-            return now_utc() + timedelta(minutes=mins)
-        # +2h or +120m style
-        val = val.lower()
+            return now_utc() + timedelta(minutes=int(val))
         if val.endswith("h") and val[:-1].isdigit():
             return now_utc() + timedelta(hours=int(val[:-1]))
         if val.endswith("m") and val[:-1].isdigit():
             return now_utc() + timedelta(minutes=int(val[:-1]))
         return None
 
-    # Absolute: YYYY-MM-DD HH:MM (assume Asia/Manila -> UTC+8)
-    # We’ll convert it to UTC for storage.
     try:
-        local_tz = timezone(timedelta(hours=8))  # Asia/Manila fixed offset
-        dt_local = datetime.strptime(inp, "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+        dt_local = datetime.strptime(inp, "%Y-%m-%d %H:%M").replace(tzinfo=MANILA)
         return dt_local.astimezone(UTC)
     except ValueError:
         return None
 
-@bot.tree.command(name="setspawn", description="Manually set the next spawn time (if you forgot to click).")
-@app_commands.describe(
-    boss="Boss name (optional).",
-    time="Either 'YYYY-MM-DD HH:MM' (Asia/Manila) or '+minutes' like +120 or +2h"
-)
-async def setspawn(interaction: discord.Interaction, boss: str = "default", time: str = ""):
-    dt = parse_time_input(time)
+# ---------------- STORAGE ----------------
+def load_data() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_data(data: dict):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+store = load_data()
+
+def get_guild_record(guild_id: int) -> dict:
+    return store.get(str(guild_id), {})
+
+def set_guild_record(guild_id: int, record: dict):
+    store[str(guild_id)] = record
+    save_data(store)
+
+def clear_guild_record(guild_id: int) -> bool:
+    gid = str(guild_id)
+    if gid in store:
+        del store[gid]
+        save_data(store)
+        return True
+    return False
+
+def get_next_spawn(guild_id: int) -> datetime | None:
+    rec = get_guild_record(guild_id)
+    iso = rec.get("next_spawn")
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso).astimezone(UTC)
+    except ValueError:
+        return None
+
+def set_next_spawn(guild_id: int, dt: datetime, channel_id: int | None):
+    rec = get_guild_record(guild_id)
+    rec["next_spawn"] = dt.astimezone(UTC).isoformat()
+    if channel_id is not None:
+        rec["channel_id"] = int(channel_id)
+    rec["notified"] = False  # reset notification flag whenever time is set
+    set_guild_record(guild_id, rec)
+
+def mark_notified(guild_id: int):
+    rec = get_guild_record(guild_id)
+    rec["notified"] = True
+    set_guild_record(guild_id, rec)
+
+# ---------------- DISCORD BOT ----------------
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+class SpawnView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Boss Down (Start 2h)", style=discord.ButtonStyle.success)
+    async def boss_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ns = now_utc() + timedelta(hours=SPAWN_INTERVAL_HOURS)
+        set_next_spawn(interaction.guild_id, ns, interaction.channel_id)
+
+        await interaction.response.send_message(
+            f"✅ Boss marked as down.\nNext spawn: {format_time(ns)}\n"
+            f"📣 Alert channel set to: <#{interaction.channel_id}>"
+        )
+
+    @discord.ui.button(label="Show Timer", style=discord.ButtonStyle.primary)
+    async def show_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ns = get_next_spawn(interaction.guild_id)
+        if not ns:
+            await interaction.response.send_message(
+                "ℹ️ No timer set yet. Click **Boss Down** when it dies.",
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"⏳ Next Boss spawn: {format_time(ns)}"
+        )
+
+    @discord.ui.button(label="How to Edit Time", style=discord.ButtonStyle.secondary)
+    async def edit_help(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Use:\n"
+            "`/setspawn time:+120`\n"
+            "`/setspawn time:+2h`\n"
+            "`/setspawn time:2026-03-03 18:30` (Manila time)\n\n"
+            "Tip: `/spawnpanel` in a channel sets that channel as the alert channel.",
+            ephemeral=True
+        )
+
+@bot.event
+async def on_ready():
+    bot.add_view(SpawnView())
+    print(f"Logged in as {bot.user}")
+    try:
+        await bot.tree.sync()
+        print("Slash commands synced.")
+    except Exception as e:
+        print("Slash sync error:", e)
+
+    if not spawn_watcher.is_running():
+        spawn_watcher.start()
+
+# ---------------- AUTO SPAWN NOTIFIER ----------------
+@tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
+async def spawn_watcher():
+    # Check every server we have stored
+    for gid_str, rec in list(store.items()):
+        try:
+            guild_id = int(gid_str)
+        except ValueError:
+            continue
+
+        next_spawn_iso = rec.get("next_spawn")
+        channel_id = rec.get("channel_id")
+        notified = bool(rec.get("notified", False))
+
+        if not next_spawn_iso or not channel_id or notified:
+            continue
+
+        try:
+            ns = datetime.fromisoformat(next_spawn_iso).astimezone(UTC)
+        except ValueError:
+            continue
+
+        if now_utc() >= ns:
+            channel = bot.get_channel(int(channel_id))
+            if channel is None:
+                # Can't find channel (bot removed / perms changed) — avoid spamming attempts
+                mark_notified(guild_id)
+                continue
+
+            try:
+                await channel.send(
+                    f"🔔 **BOSS SPAWN NOW!**\nScheduled spawn time: {format_time(ns)}"
+                )
+            finally:
+                # Make sure we only send once
+                mark_notified(guild_id)
+
+# ---------------- SLASH COMMANDS ----------------
+@bot.tree.command(name="spawnpanel", description="Show the Boss spawn panel (also sets this channel as alert channel).")
+async def spawnpanel(interaction: discord.Interaction):
+    # Save channel as alert channel even if timer isn't set yet
+    rec = get_guild_record(interaction.guild_id)
+    rec["channel_id"] = int(interaction.channel_id)
+    # don't force notified reset here; only when time is set
+    set_guild_record(interaction.guild_id, rec)
+
+    await interaction.response.send_message(
+        f"📌 **Boss Spawn Timer**\n📣 Alert channel set to: <#{interaction.channel_id}>",
+        view=SpawnView()
+    )
+
+@bot.tree.command(name="setspawn", description="Manually set next spawn time (also sets this channel as alert channel).")
+@app_commands.describe(time="Use +minutes, +2h, or YYYY-MM-DD HH:MM (Manila)")
+async def setspawn(interaction: discord.Interaction, time: str):
+    dt = parse_time(time)
     if not dt:
         await interaction.response.send_message(
-            "❌ Invalid time.\nUse `YYYY-MM-DD HH:MM` (Asia/Manila) or `+120` (minutes) or `+2h`.",
+            "❌ Invalid format.\nUse `+120`, `+2h`, or `YYYY-MM-DD HH:MM` (Manila).",
             ephemeral=True
         )
         return
-    store.set_next_spawn(interaction.guild_id, boss, dt)
+
+    set_next_spawn(interaction.guild_id, dt, interaction.channel_id)
     await interaction.response.send_message(
-        f"✅ Set **{boss}** next spawn to: {format_discord_timestamp(dt)}",
-        ephemeral=False
+        f"✅ Spawn updated: {format_time(dt)}\n📣 Alert channel set to: <#{interaction.channel_id}>"
     )
 
-@bot.tree.command(name="clearspawn", description="Clear the spawn timer for a boss.")
-@app_commands.describe(boss="Boss name (optional).")
-async def clearspawn(interaction: discord.Interaction, boss: str = "default"):
-    gid = guild_key(interaction.guild_id)
-    bk = boss_key(boss)
-    if gid in store.data and bk in store.data[gid]:
-        del store.data[gid][bk]
-        save_data(store.data)
-        await interaction.response.send_message(f"🗑️ Cleared timer for **{boss}**.", ephemeral=False)
+@bot.tree.command(name="clearspawn", description="Clear the spawn timer.")
+async def clearspawn(interaction: discord.Interaction):
+    if clear_guild_record(interaction.guild_id):
+        await interaction.response.send_message("🗑️ Spawn timer cleared.")
     else:
-        await interaction.response.send_message(f"ℹ️ No timer found for **{boss}**.", ephemeral=True)
+        await interaction.response.send_message("ℹ️ No timer set.", ephemeral=True)
 
-# ---- RUN ----
-# Put your token in an environment variable for safety:
-# Windows (PowerShell): $env:DISCORD_TOKEN="YOUR_TOKEN"
-# Linux/macOS: export DISCORD_TOKEN="YOUR_TOKEN"
-token = os.getenv("DISCORD_TOKEN")
-if not token:
-    raise RuntimeError("Set DISCORD_TOKEN env var first.")
-bot.run(token)
+# ---------------- RUN ----------------
+if __name__ == "__main__":
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("Set DISCORD_TOKEN in Render Environment Variables.")
+
+    threading.Thread(target=run_web_server, daemon=True).start()
+    bot.run(token)
