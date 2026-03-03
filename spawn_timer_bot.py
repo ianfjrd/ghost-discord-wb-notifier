@@ -1,10 +1,12 @@
 import os
 import threading
+import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import discord
 from discord.ext import commands
 from discord import app_commands
+from discord.errors import HTTPException
 
 
 # -------------------------
@@ -36,8 +38,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (id={bot.user.id})")
-
-    # Fast command registration: if GUILD_ID is set, sync instantly to that server
     guild_id = os.getenv("GUILD_ID")
     try:
         if guild_id:
@@ -46,7 +46,7 @@ async def on_ready():
             print(f"✅ Synced {len(synced)} commands to guild {guild_id}")
         else:
             synced = await bot.tree.sync()
-            print(f"✅ Synced {len(synced)} global commands (may take time to appear)")
+            print(f"✅ Synced {len(synced)} global commands")
     except Exception as e:
         print("❌ Slash sync error:", repr(e))
 
@@ -56,13 +56,26 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong! ✅")
 
 
+async def run_bot_forever(token: str):
+    delay = 30  # start with 30s to be gentle
+    while True:
+        try:
+            await bot.start(token)
+        except HTTPException as e:
+            # Includes 429. Don't exit; wait and retry.
+            print(f"Discord HTTPException (likely rate limit): {e}")
+        except Exception as e:
+            print(f"Bot error: {repr(e)}")
+
+        print(f"Retrying login in {delay} seconds...")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 900)  # max 15 minutes
+
+
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN is missing in Render environment variables.")
 
-    # Start health server thread so Render Web Service stays alive
     threading.Thread(target=run_web_server, daemon=True).start()
-
-    # Start Discord bot
-    bot.run(token)
+    asyncio.run(run_bot_forever(token))
