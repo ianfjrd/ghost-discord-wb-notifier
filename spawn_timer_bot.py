@@ -1,10 +1,14 @@
 import os
 import json
+import threading
+import asyncio
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+from discord.errors import HTTPException
 
 # ---------------- CONFIG ----------------
 DATA_FILE = "spawns.json"
@@ -13,6 +17,22 @@ CHECK_INTERVAL_SECONDS = 5
 
 UTC = timezone.utc
 MANILA = timezone(timedelta(hours=8))  # Asia/Manila
+ROLE_ID_TO_PING = 1425512694953541843
+
+# ---------------- Render Web Server (keeps Web Service alive) ----------------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK - bot running")
+
+    def log_message(self, format, *args):
+        return
+
+def run_web_server():
+    port = int(os.environ.get("PORT", "10000"))
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # ---------------- TIME HELPERS ----------------
 def now_utc() -> datetime:
@@ -23,12 +43,6 @@ def format_time(dt: datetime) -> str:
     return f"<t:{unix}:F> • <t:{unix}:R>"
 
 def parse_time(inp: str) -> datetime | None:
-    """
-    Accepts:
-      +120        (minutes)
-      +2h / +90m  (relative)
-      2026-03-03 18:30  (absolute, assumed Asia/Manila)
-    """
     inp = (inp or "").strip()
     if not inp:
         return None
@@ -106,14 +120,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 class SpawnView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=600)  # 10 minutes; buttons still work while bot running
+        super().__init__(timeout=600)
 
     @discord.ui.button(label="World Boss Down (Start 2h)", style=discord.ButtonStyle.success)
     async def boss_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         ns = now_utc() + timedelta(hours=SPAWN_INTERVAL_HOURS)
         set_next_spawn(interaction.guild_id, ns, interaction.channel_id)
         await interaction.response.send_message(
-            f"✅World Boss marked as down.\nNext spawn: {format_time(ns)}\n📣 Alert channel: <#{interaction.channel_id}>"
+            f"✅ World Boss marked as down.\nNext spawn: {format_time(ns)}\n📣 Alert channel: <#{interaction.channel_id}>"
         )
 
     @discord.ui.button(label="Show Timer", style=discord.ButtonStyle.primary)
@@ -121,7 +135,7 @@ class SpawnView(discord.ui.View):
         ns = get_next_spawn(interaction.guild_id)
         if not ns:
             await interaction.response.send_message(
-                "ℹ️ No timer set yet. Click **Boss Down** when it dies.",
+                "ℹ️ No timer set yet. Click **World Boss Down** when it dies.",
                 ephemeral=True
             )
             return
@@ -156,7 +170,6 @@ async def on_ready():
     if not spawn_watcher.is_running():
         spawn_watcher.start()
 
-# ---------------- AUTO SPAWN NOTIFIER ----------------
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def spawn_watcher():
     for gid_str, rec in list(store.items()):
@@ -184,14 +197,15 @@ async def spawn_watcher():
                 continue
 
             try:
-                await channel.send(f"🔔 **WORLD BOSS SPAWN NOW!** !** <@&1425512694953541843>\nScheduled spawn time: {format_time(ns)}")
+                await channel.send(
+                    f"🔔 **WORLD BOSS SPAWN NOW!** <@&{ROLE_ID_TO_PING}>\n"
+                    f"Scheduled spawn time: {format_time(ns)}"
+                )
             finally:
                 mark_notified(guild_id)
 
-# ---------------- SLASH COMMANDS ----------------
-@bot.tree.command(name="spawnpanel", description="Show the Boss spawn panel (also sets this channel as alert channel).")
+@bot.tree.command(name="spawnpanel", description="Show the Boss spawn panel (sets this channel as alert channel).")
 async def spawnpanel(interaction: discord.Interaction):
-    # Save current channel as alert channel
     rec = get_rec(interaction.guild_id)
     rec["channel_id"] = int(interaction.channel_id)
     set_rec(interaction.guild_id, rec)
@@ -201,7 +215,7 @@ async def spawnpanel(interaction: discord.Interaction):
         view=SpawnView()
     )
 
-@bot.tree.command(name="setspawn", description="Manually set next spawn time (also sets this channel as alert channel).")
+@bot.tree.command(name="setspawn", description="Manually set next spawn time (sets this channel as alert channel).")
 @app_commands.describe(time="Use +minutes, +2h, or YYYY-MM-DD HH:MM (Manila)")
 async def setspawn(interaction: discord.Interaction, time: str):
     dt = parse_time(time)
@@ -224,9 +238,25 @@ async def clearspawn(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("ℹ️ No timer set.", ephemeral=True)
 
-# ---------------- RUN ----------------
+# ---------------- RUN (safe retry loop to avoid 429 restart spam) ----------------
+async def run_bot_forever(token: str):
+    delay = 60  # start gentle to avoid global rate limits
+    while True:
+        try:
+            await bot.start(token)
+        except HTTPException as e:
+            print(f"Discord HTTPException (login/start): {e}")
+        except Exception as e:
+            print(f"Bot crashed: {repr(e)}")
+
+        print(f"Retrying in {delay} seconds...")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 900)  # max 15 minutes
+
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        raise RuntimeError("Set DISCORD_TOKEN first (same terminal).")
-    bot.run(token)
+        raise RuntimeError("DISCORD_TOKEN env var is missing on Render.")
+
+    threading.Thread(target=run_web_server, daemon=True).start()
+    asyncio.run(run_bot_forever(token))
