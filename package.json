@@ -1,0 +1,13 @@
+{
+  "name": "wb-spawn-now-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "express": "^4.19.2"
+  }
+}
