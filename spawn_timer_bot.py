@@ -163,9 +163,16 @@ class SpawnView(discord.ui.View):
 async def on_ready():
     bot.add_view(SpawnView())
     print(f"Logged in as {bot.user}")
+
+    guild_id = os.getenv("GUILD_ID")
     try:
-        await bot.tree.sync()
-        print("Slash commands synced.")
+        if guild_id:
+            guild = discord.Object(id=int(guild_id))
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} commands to guild {guild_id}.")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} global commands.")
     except Exception as e:
         print("Slash sync error:", e)
 
@@ -275,4 +282,5 @@ if __name__ == "__main__":
             delay = min(delay * 2, 300)
 
     asyncio.run(main())
+
 
